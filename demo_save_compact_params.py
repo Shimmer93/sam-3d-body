@@ -547,7 +547,7 @@ def main(args):
     )
 
     human_detector, human_segmentor, fov_estimator = None, None, None
-    if args.detector_name:
+    if args.detector_name and args.detector_name.lower() != "none":
         from tools.build_detector import HumanDetector
 
         human_detector = HumanDetector(
@@ -674,7 +674,7 @@ if __name__ == "__main__":
         "--detector_name",
         default="vitdet",
         type=str,
-        help="Human detection model for demo (Default `vitdet`, add your favorite detector if needed).",
+        help="Human detection model for demo (default `vitdet`; use `none` to skip detection and fall back to the full image bbox).",
     )
     parser.add_argument(
         "--segmentor_name",
