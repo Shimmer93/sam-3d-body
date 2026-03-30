@@ -105,6 +105,8 @@ saved camera intrinsics match the camera intrinsics actually used by the model.
 
 import argparse
 import os
+from pathlib import Path
+import sys
 from glob import glob
 from typing import Any
 
@@ -122,6 +124,7 @@ import numpy as np
 import torch
 from sam_3d_body import SAM3DBodyEstimator, load_sam_3d_body
 from tqdm import tqdm
+import trimesh
 
 
 def load_image_rgb_and_size(image_path: str):
@@ -220,6 +223,63 @@ def validate_conversion_args(args) -> None:
             )
 
 
+def find_local_mhr_repo() -> tuple[Path | None, Path | None]:
+    """Locate a local MHR checkout plus its SMPL conversion tool directory."""
+    repo_root = Path(root)
+    candidate_roots = []
+
+    env_override = os.environ.get("MHR_REPO_PATH", "").strip()
+    if env_override:
+        candidate_roots.append(Path(env_override).expanduser())
+
+    # `pyrootutils` resolves to the nearest project root, which for this script is
+    # usually `external/sam-3d-body` rather than the top-level repo. Search both
+    # that subtree and a few parent-level layouts.
+    search_roots = [repo_root, *list(repo_root.parents[:3])]
+    for search_root in search_roots:
+        candidate_roots.extend(
+            [
+                search_root / "external" / "MHR",
+                search_root / "external" / "mhr",
+            ]
+        )
+
+    seen_roots = set()
+    deduped_candidate_roots = []
+    for candidate_root in candidate_roots:
+        resolved = candidate_root.expanduser().resolve(strict=False)
+        if resolved in seen_roots:
+            continue
+        seen_roots.add(resolved)
+        deduped_candidate_roots.append(candidate_root)
+
+    for candidate_root in deduped_candidate_roots:
+        tool_dir = candidate_root / "tools" / "mhr_smpl_conversion"
+        if (candidate_root / "mhr").is_dir() and tool_dir.is_dir():
+            return candidate_root, tool_dir
+
+    return None, None
+
+
+def register_local_mhr_conversion_paths() -> Path | None:
+    """
+    Expose the official MHR repo and its conversion tool on `sys.path` when present.
+
+    The conversion code in `tools/mhr_smpl_conversion` is not packaged as a normal
+    installable module, so register both the repo root and the tool directory.
+    """
+    mhr_repo_dir, conversion_tool_dir = find_local_mhr_repo()
+    if conversion_tool_dir is None:
+        return None
+
+    for path in (mhr_repo_dir, conversion_tool_dir):
+        path_str = str(path)
+        if path_str not in sys.path:
+            sys.path.insert(0, path_str)
+
+    return conversion_tool_dir
+
+
 def import_smpl_conversion_dependencies():
     """
     Import the optional MHR->SMPL conversion stack only when it is requested.
@@ -227,6 +287,7 @@ def import_smpl_conversion_dependencies():
     The implementation follows the official MHR conversion tool documented at:
     https://github.com/facebookresearch/MHR/blob/main/tools/mhr_smpl_conversion/README.md
     """
+    conversion_tool_dir = register_local_mhr_conversion_paths()
     missing_packages = []
 
     try:
@@ -246,9 +307,12 @@ def import_smpl_conversion_dependencies():
         from smpl_mhr import Conversion
     except ImportError:
         try:
-            from tools.mhr_smpl_conversion.conversion import Conversion
+            from conversion import Conversion
         except ImportError:
-            Conversion = None
+            try:
+                from tools.mhr_smpl_conversion.conversion import Conversion
+            except ImportError:
+                Conversion = None
 
     if missing_packages or Conversion is None:
         details = []
@@ -256,6 +320,10 @@ def import_smpl_conversion_dependencies():
             details.append(f"missing packages: {', '.join(sorted(missing_packages))}")
         if Conversion is None:
             details.append("missing conversion module: smpl_mhr")
+        if conversion_tool_dir is None:
+            details.append(
+                "MHR conversion repo not found; initialize `external/MHR` or set `MHR_REPO_PATH`"
+            )
         raise ImportError(
             "Optional SMPL/SMPL-X export requires the MHR conversion stack from "
             "https://github.com/facebookresearch/MHR/blob/main/tools/mhr_smpl_conversion/README.md; "
@@ -263,6 +331,144 @@ def import_smpl_conversion_dependencies():
         )
 
     return smplx, MHR, Conversion
+
+
+def import_direct_smpl_export_dependencies():
+    """
+    Import the minimal dependencies for direct SAM3D->SMPL export.
+
+    Unlike the full MHR conversion stack, this path avoids `MHR.from_files(...)`
+    and fits SMPL directly from SAM3D-predicted MHR-space vertices.
+    """
+    register_local_mhr_conversion_paths()
+
+    try:
+        import smplx
+    except ImportError as exc:
+        raise ImportError(
+            "Optional SMPL export requires `smplx` to be installed."
+        ) from exc
+
+    try:
+        from pytorch_fitting import PyTorchSMPLFitting
+    except ImportError as exc:
+        raise ImportError(
+            "Optional SMPL export requires the local `external/MHR/tools/mhr_smpl_conversion` "
+            "tooling to be importable."
+        ) from exc
+
+    return smplx, PyTorchSMPLFitting
+
+
+def load_mhr_to_smpl_surface_mapping() -> tuple[np.ndarray, np.ndarray]:
+    """Load the precomputed MHR->SMPL barycentric surface mapping."""
+    mapping_path = (
+        Path(root).resolve() / ".." / "MHR" / "tools" / "mhr_smpl_conversion" / "assets" / "mhr2smpl_mapping.npz"
+    ).resolve()
+    if not mapping_path.exists():
+        raise FileNotFoundError(f"MHR->SMPL mapping file not found: {mapping_path}")
+
+    mapping = np.load(mapping_path)
+    return mapping["triangle_ids"], mapping["baryc_coords"]
+
+
+def build_direct_smpl_exporter(
+    args, smplx_module, pytorch_smpl_fitting_cls, device: torch.device
+) -> dict[str, Any]:
+    """Build a direct SAM3D vertex -> SMPL exporter without `MHR.from_files(...)`."""
+    scripted_mhr_model = torch.jit.load(args.mhr_path, map_location="cpu")
+    mhr_faces = scripted_mhr_model.character_torch.mesh.faces.detach().cpu().numpy()
+    del scripted_mhr_model
+
+    mapped_face_id, baryc_coords = load_mhr_to_smpl_surface_mapping()
+
+    try:
+        smpl_model = smplx_module.SMPL(
+            model_path=args.smpl_model_path,
+            gender=args.smpl_gender,
+        )
+    except ModuleNotFoundError as exc:
+        if exc.name == "chumpy":
+            raise ModuleNotFoundError(
+                "Loading the provided SMPL `.pkl` file requires the `chumpy` package. "
+                "Install `chumpy`, or switch `--smpl_model_path` to an official SMPL `.npz` "
+                "model file."
+            ) from exc
+        raise
+    smpl_model = smpl_model.to(str(device))
+    smpl_template_mesh = trimesh.Trimesh(
+        smpl_model.v_template.detach().cpu().numpy(),
+        smpl_model.faces,
+        process=False,
+    )
+    smpl_edges = torch.from_numpy(smpl_template_mesh.edges_unique.copy()).long()
+
+    return {
+        "kind": "smpl",
+        "prefix": "smpl",
+        "mode": "direct_vertices_to_smpl",
+        "smpl_model": smpl_model,
+        "smpl_edges": smpl_edges,
+        "smpl_model_type": "smpl",
+        "hand_pose_dim": 0,
+        "mhr_faces": mhr_faces,
+        "mapped_face_id": mapped_face_id,
+        "baryc_coords": baryc_coords,
+        "solver_cls": pytorch_smpl_fitting_cls,
+        "device": str(device),
+        "batch_size": args.smpl_conversion_batch_size,
+        "empty_parameters": build_empty_smpl_parameter_template("smpl", smpl_model),
+    }
+
+
+def find_mhr_assets_dir(args) -> Path | None:
+    """Locate the full MHR asset bundle required by `MHR.from_files(...)`."""
+    if getattr(args, "mhr_path", ""):
+        mhr_path = Path(args.mhr_path).expanduser()
+        # `--mhr_path` points to `.../assets/mhr_model.pt` in the common setup.
+        if mhr_path.suffix:
+            candidate_dirs = [mhr_path.parent, mhr_path.parent / "assets"]
+        else:
+            candidate_dirs = [mhr_path, mhr_path / "assets"]
+    else:
+        candidate_dirs = []
+
+        env_override = os.environ.get("MHR_ASSET_PATH", "").strip()
+        if env_override:
+            candidate_dirs.append(Path(env_override).expanduser())
+
+        repo_root = Path(root)
+        search_roots = [repo_root, *list(repo_root.parents[:3])]
+        checkpoint_path = getattr(args, "checkpoint_path", "")
+        if checkpoint_path:
+            checkpoint_dir = Path(checkpoint_path).expanduser().parent
+            search_roots = [checkpoint_dir, checkpoint_dir.parent, *search_roots]
+
+        for search_root in search_roots:
+            candidate_dirs.extend(
+                [
+                    search_root / "external" / "MHR" / "assets",
+                    search_root / "external" / "mhr" / "assets",
+                    search_root / "assets",
+                ]
+            )
+
+    seen_dirs = set()
+    required_files = (
+        "lod1.fbx",
+        "compact_v6_1.model",
+        "corrective_activation.npz",
+        "corrective_blendshapes_lod1.npz",
+    )
+    for candidate_dir in candidate_dirs:
+        resolved = candidate_dir.expanduser().resolve(strict=False)
+        if resolved in seen_dirs:
+            continue
+        seen_dirs.add(resolved)
+        if all((candidate_dir / filename).exists() for filename in required_files):
+            return candidate_dir
+
+    return None
 
 
 def build_empty_smpl_parameter_template(
@@ -302,40 +508,46 @@ def build_optional_smpl_exporters(args, device: torch.device) -> list[dict[str, 
     if not args.export_smpl_params and not args.export_smplx_params:
         return []
 
-    smplx, MHR, Conversion = import_smpl_conversion_dependencies()
-
-    try:
-        mhr_model = MHR.from_files(device=device, lod=1)
-    except Exception as exc:
-        raise RuntimeError(
-            "Failed to initialize `mhr.MHR.from_files()` for optional SMPL/SMPL-X export"
-        ) from exc
-
     exporters = []
 
     if args.export_smpl_params:
-        smpl_model = smplx.SMPL(
-            model_path=args.smpl_model_path,
-            gender=args.smpl_gender,
-        )
+        smplx_module, pytorch_smpl_fitting_cls = import_direct_smpl_export_dependencies()
         exporters.append(
-            {
-                "kind": "smpl",
-                "prefix": "smpl",
-                "converter": Conversion(
-                    mhr_model=mhr_model,
-                    smpl_model=smpl_model,
-                    method=args.smpl_conversion_method,
-                    batch_size=args.smpl_conversion_batch_size,
-                ),
-                "batch_size": args.smpl_conversion_batch_size,
-                "empty_parameters": build_empty_smpl_parameter_template(
-                    "smpl", smpl_model
-                ),
-            }
+            build_direct_smpl_exporter(
+                args=args,
+                smplx_module=smplx_module,
+                pytorch_smpl_fitting_cls=pytorch_smpl_fitting_cls,
+                device=device,
+            )
         )
 
     if args.export_smplx_params:
+        smplx, MHR, Conversion = import_smpl_conversion_dependencies()
+        mhr_assets_dir = find_mhr_assets_dir(args)
+        if mhr_assets_dir is None:
+            if getattr(args, "mhr_path", ""):
+                mhr_path = Path(args.mhr_path).expanduser()
+                expected_dir = mhr_path.parent if mhr_path.suffix else mhr_path
+                raise FileNotFoundError(
+                    "Optional SMPL-X export requires the full MHR asset bundle in "
+                    f"`{expected_dir}`. Expected files such as `lod1.fbx`, "
+                    "`compact_v6_1.model`, `corrective_activation.npz`, and "
+                    "`corrective_blendshapes_lod1.npz` next to the provided "
+                    "`--mhr_path`."
+                )
+            raise FileNotFoundError(
+                "Optional SMPL-X export requires the full MHR asset bundle. "
+                "Expected files such as `lod1.fbx`, `compact_v6_1.model`, "
+                "`corrective_activation.npz`, and `corrective_blendshapes_lod1.npz`."
+            )
+
+        try:
+            mhr_model = MHR.from_files(folder=mhr_assets_dir, device=device, lod=1)
+        except Exception as exc:
+            raise RuntimeError(
+                "Failed to initialize `mhr.MHR.from_files()` for optional SMPL-X export"
+            ) from exc
+
         smplx_model = smplx.SMPLX(
             model_path=args.smplx_model_path,
             gender=args.smplx_gender,
@@ -408,6 +620,15 @@ def run_sam3d_to_smpl_conversion(
             exporter["prefix"], exporter["empty_parameters"].copy()
         )
 
+    if exporter.get("mode") == "direct_vertices_to_smpl":
+        results_parameters = run_direct_vertices_to_smpl_conversion(outputs, exporter)
+        completed_parameters = complete_optional_parameter_dict(
+            parameters=results_parameters,
+            empty_template=exporter["empty_parameters"],
+            num_people=len(outputs),
+        )
+        return prefix_parameter_dict(exporter["prefix"], completed_parameters)
+
     convert_fn = getattr(exporter["converter"], "convert_sam3d_output_to_smpl", None)
     if convert_fn is None and exporter["kind"] == "smplx":
         convert_fn = getattr(exporter["converter"], "convert_sam3d_output_to_smplx", None)
@@ -436,6 +657,53 @@ def run_sam3d_to_smpl_conversion(
         num_people=len(outputs),
     )
     return prefix_parameter_dict(exporter["prefix"], completed_parameters)
+
+
+def run_direct_vertices_to_smpl_conversion(
+    outputs, exporter: dict[str, Any]
+) -> dict[str, Any]:
+    """Fit SMPL directly from SAM3D-predicted MHR-space vertices."""
+    pred_vertices = np.stack(
+        [np.asarray(person_output["pred_vertices"], dtype=np.float32) for person_output in outputs],
+        axis=0,
+    )
+    pred_cam_t = np.stack(
+        [np.asarray(person_output["pred_cam_t"], dtype=np.float32) for person_output in outputs],
+        axis=0,
+    )
+
+    device = torch.device(exporter["device"])
+    # SAM3D `pred_vertices` are in meters and camera-relative. Convert to the MHR
+    # world-space convention used by the official conversion code.
+    mhr_vertices = torch.from_numpy(
+        100.0 * pred_vertices + 100.0 * pred_cam_t[:, None, :]
+    ).to(device=device, dtype=torch.float32)
+
+    source_vertices = mhr_vertices * 0.01  # centimeters -> meters
+    mapped_face_id = torch.from_numpy(exporter["mapped_face_id"]).long().to(device)
+    baryc_coords = (
+        torch.from_numpy(exporter["baryc_coords"]).to(device=device, dtype=torch.float32)[
+            None, :, :, None
+        ]
+    )
+    source_faces = torch.from_numpy(exporter["mhr_faces"]).long().to(device)
+
+    triangles = source_vertices[:, source_faces[mapped_face_id], :]
+    target_vertices = (triangles * baryc_coords).sum(dim=2)
+
+    solver = exporter["solver_cls"](
+        smpl_model=exporter["smpl_model"],
+        smpl_edges=exporter["smpl_edges"],
+        smpl_model_type=exporter["smpl_model_type"],
+        hand_pose_dim=exporter["hand_pose_dim"],
+        device=exporter["device"],
+        batch_size=exporter["batch_size"],
+    )
+    return solver.fit(
+        target_vertices=target_vertices,
+        single_identity=False,
+        is_tracking=False,
+    )
 
 
 def package_optional_smpl_outputs(outputs, exporters) -> dict:
@@ -547,7 +815,7 @@ def main(args):
     )
 
     human_detector, human_segmentor, fov_estimator = None, None, None
-    if args.detector_name and args.detector_name.lower() != "none":
+    if args.detector_name:
         from tools.build_detector import HumanDetector
 
         human_detector = HumanDetector(
@@ -674,7 +942,7 @@ if __name__ == "__main__":
         "--detector_name",
         default="vitdet",
         type=str,
-        help="Human detection model for demo (default `vitdet`; use `none` to skip detection and fall back to the full image bbox).",
+        help="Human detection model for demo (Default `vitdet`, add your favorite detector if needed).",
     )
     parser.add_argument(
         "--segmentor_name",
