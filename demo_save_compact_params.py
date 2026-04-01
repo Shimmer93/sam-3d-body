@@ -123,6 +123,8 @@ import cv2
 import numpy as np
 import torch
 from sam_3d_body import SAM3DBodyEstimator, load_sam_3d_body
+from sam_3d_body.data.utils.prepare_batch import prepare_batch
+from sam_3d_body.utils import recursive_to
 from tqdm import tqdm
 import trimesh
 
@@ -793,7 +795,101 @@ def save_compact_npz(save_path: str, packaged_outputs: dict) -> None:
     np.savez_compressed(save_path, **packaged_outputs)
 
 
+@torch.no_grad()
+def process_images_batched(
+    image_paths: list[str],
+    estimator,
+    device: torch.device,
+    fov_estimator=None,
+):
+    """
+    Process multiple cropped images in one batched forward pass (body-only).
+
+    Each image is assumed to contain exactly 1 person (full-image bbox).
+    Returns a list of (outputs, image_size, cam_int) tuples, one per image.
+    """
+    batch_dicts = []
+    image_sizes = []
+    cam_ints = []
+
+    for image_path in image_paths:
+        image_rgb, image_size = load_image_rgb_and_size(image_path)
+        image_sizes.append(image_size)
+
+        cam_int = resolve_cam_intrinsics(
+            image_path=image_path,
+            image_rgb=image_rgb,
+            image_size=image_size,
+            fov_estimator=fov_estimator,
+            device=device,
+        )
+        cam_ints.append(cam_int)
+
+        height, width = image_rgb.shape[:2]
+        boxes = np.array([0, 0, width, height]).reshape(1, 4)
+        batch = prepare_batch(
+            image_rgb, estimator.transform, boxes, cam_int=cam_int
+        )
+        batch_dicts.append(batch)
+
+    # Stack individual batch dicts along the batch dimension.
+    combined = {}
+    for key in batch_dicts[0]:
+        if isinstance(batch_dicts[0][key], torch.Tensor):
+            combined[key] = torch.cat([b[key] for b in batch_dicts], dim=0)
+        elif isinstance(batch_dicts[0][key], list):
+            combined[key] = []
+            for b in batch_dicts:
+                combined[key].extend(b[key])
+
+    combined = recursive_to(combined, "cuda")
+
+    model = estimator.model
+    model._initialize_batch(combined)
+
+    # Body-only forward pass (skips hand refinement)
+    pose_output = model.forward_step(combined, decoder_type="body")
+
+    out = pose_output["mhr"]
+    out = recursive_to(out, "cpu")
+    out = recursive_to(out, "numpy")
+    combined = recursive_to(combined, "cpu")
+
+    # Split results per image
+    per_image_results = []
+    for i in range(len(image_paths)):
+        person_out = {
+            "bbox": combined["bbox"][i, 0].numpy(),
+            "focal_length": out["focal_length"][i],
+            "pred_keypoints_3d": out["pred_keypoints_3d"][i],
+            "pred_keypoints_2d": out["pred_keypoints_2d"][i],
+            "pred_vertices": out["pred_vertices"][i],
+            "pred_cam_t": out["pred_cam_t"][i],
+            "pred_pose_raw": out["pred_pose_raw"][i],
+            "global_rot": out["global_rot"][i],
+            "body_pose_params": out["body_pose"][i],
+            "hand_pose_params": out["hand"][i],
+            "scale_params": out["scale"][i],
+            "shape_params": out["shape"][i],
+            "expr_params": out["face"][i],
+            "mask": None,
+            "pred_joint_coords": out["pred_joint_coords"][i],
+            "pred_global_rots": out["joint_global_rots"][i],
+            "mhr_model_params": out["mhr_model_params"][i],
+        }
+        per_image_results.append(([person_out], image_sizes[i], cam_ints[i]))
+
+    return per_image_results
+
+
 def main(args):
+    if args.batch_size > 1 and args.inference_type != "body":
+        print(
+            f"Note: --batch_size {args.batch_size} requires --inference_type body. "
+            "Switching to body-only inference."
+        )
+        args.inference_type = "body"
+
     if args.output_folder == "":
         image_folder_name = os.path.basename(os.path.normpath(args.image_folder))
         output_folder = os.path.join("./output_params", image_folder_name)
@@ -862,29 +958,80 @@ def main(args):
         ]
     )
 
-    for image_path in tqdm(images_list):
-        image_rgb, image_size = load_image_rgb_and_size(image_path)
-        cam_int = resolve_cam_intrinsics(
-            image_path=image_path,
-            image_rgb=image_rgb,
-            image_size=image_size,
-            fov_estimator=fov_estimator,
-            device=device,
-        )
+    if args.batch_size > 1:
+        # Batched forward-pass path (body-only, no hand refinement).
+        batch_size = args.batch_size
+        chunks = [
+            images_list[i : i + batch_size]
+            for i in range(0, len(images_list), batch_size)
+        ]
+        for chunk in tqdm(chunks, desc="Batches"):
+            results = process_images_batched(
+                chunk, estimator, device, fov_estimator
+            )
 
-        outputs = estimator.process_one_image(
-            image_path,
-            cam_int=cam_int,
-            bbox_thr=args.bbox_thresh,
-            use_mask=args.use_mask,
-        )
+            # Collect all per-person outputs for batched SMPL conversion.
+            all_outputs = []
+            for outputs, _, _ in results:
+                all_outputs.extend(outputs)
 
-        packaged_outputs = package_compact_outputs(outputs, image_size, cam_int)
-        packaged_outputs.update(package_optional_smpl_outputs(outputs, smpl_exporters))
+            # Run SMPL conversion once for the entire chunk.
+            if smpl_exporters and len(all_outputs) > 0:
+                all_smpl = package_optional_smpl_outputs(
+                    all_outputs, smpl_exporters
+                )
+            else:
+                all_smpl = {}
 
-        image_name = os.path.splitext(os.path.basename(image_path))[0]
-        save_path = os.path.join(output_folder, f"{image_name}.npz")
-        save_compact_npz(save_path, packaged_outputs)
+            # Split results per image and save.
+            person_idx = 0
+            for (outputs, image_size, cam_int), image_path in zip(
+                results, chunk
+            ):
+                n_persons = len(outputs)
+                packaged = package_compact_outputs(
+                    outputs, image_size, cam_int
+                )
+                # Slice the batched SMPL arrays for this image's persons.
+                for key, value in all_smpl.items():
+                    packaged[key] = value[person_idx : person_idx + n_persons]
+                person_idx += n_persons
+
+                image_name = os.path.splitext(
+                    os.path.basename(image_path)
+                )[0]
+                save_path = os.path.join(output_folder, f"{image_name}.npz")
+                save_compact_npz(save_path, packaged)
+    else:
+        # Per-image processing (original path, supports full inference).
+        for image_path in tqdm(images_list):
+            image_rgb, image_size = load_image_rgb_and_size(image_path)
+            cam_int = resolve_cam_intrinsics(
+                image_path=image_path,
+                image_rgb=image_rgb,
+                image_size=image_size,
+                fov_estimator=fov_estimator,
+                device=device,
+            )
+
+            outputs = estimator.process_one_image(
+                image_path,
+                cam_int=cam_int,
+                bbox_thr=args.bbox_thresh,
+                use_mask=args.use_mask,
+                inference_type=args.inference_type,
+            )
+
+            packaged_outputs = package_compact_outputs(
+                outputs, image_size, cam_int
+            )
+            packaged_outputs.update(
+                package_optional_smpl_outputs(outputs, smpl_exporters)
+            )
+
+            image_name = os.path.splitext(os.path.basename(image_path))[0]
+            save_path = os.path.join(output_folder, f"{image_name}.npz")
+            save_compact_npz(save_path, packaged_outputs)
 
 
 if __name__ == "__main__":
@@ -991,6 +1138,27 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Use mask-conditioned prediction (segmentation mask is automatically generated from bbox)",
+    )
+    parser.add_argument(
+        "--inference_type",
+        default="body",
+        type=str,
+        choices=["body", "full"],
+        help=(
+            "Inference type: 'body' skips hand refinement (faster), "
+            "'full' runs hand decoder for detailed hand pose (slower). "
+            "Default: 'body'"
+        ),
+    )
+    parser.add_argument(
+        "--batch_size",
+        default=1,
+        type=int,
+        help=(
+            "Number of images to process per forward pass. "
+            "Requires --inference_type body (enforced automatically). "
+            "Set to 1 for per-image processing. Default: 1"
+        ),
     )
     parser.add_argument(
         "--export_smpl_params",
