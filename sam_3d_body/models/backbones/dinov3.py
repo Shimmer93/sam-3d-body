@@ -13,7 +13,7 @@ class Dinov3Backbone(nn.Module):
         self.cfg = cfg
 
         self.encoder = torch.hub.load(
-            "facebookresearch/dinov3",
+            "facebookresearch/dinov3:main",
             self.name,
             source="github",
             pretrained=False,

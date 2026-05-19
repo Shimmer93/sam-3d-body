@@ -2,6 +2,7 @@
 
 import os
 import warnings
+from pathlib import Path
 from typing import Optional
 
 import roma
@@ -105,11 +106,16 @@ class MHRHead(nn.Module):
         )
 
         # Load MHR itself
+        mhr_device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         if MOMENTUM_ENABLED:
-            self.mhr = MHR.from_files(
-                device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
-                lod=1,
-            )
+            mhr_assets_dir = None
+            if mhr_model_path:
+                candidate = Path(mhr_model_path).expanduser()
+                mhr_assets_dir = candidate.parent if candidate.suffix else candidate
+            if mhr_assets_dir is not None and (mhr_assets_dir / "lod1.fbx").exists():
+                self.mhr = MHR.from_files(folder=mhr_assets_dir, device=mhr_device, lod=1)
+            else:
+                self.mhr = MHR.from_files(device=mhr_device, lod=1)
         else:
             self.mhr = torch.jit.load(
                 mhr_model_path,

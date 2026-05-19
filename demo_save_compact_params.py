@@ -755,6 +755,17 @@ def stack_person_field(outputs, key: str, expected_dim: int) -> np.ndarray:
     return stacked
 
 
+def stack_optional_person_field(outputs, key: str) -> np.ndarray | None:
+    """Stack one optional per-person field when every detection provides it."""
+    if not outputs or any(key not in person_output for person_output in outputs):
+        return None
+    values = [np.asarray(person_output[key], dtype=np.float32) for person_output in outputs]
+    try:
+        return np.stack(values, axis=0)
+    except ValueError:
+        return None
+
+
 def package_compact_outputs(
     outputs, image_size: np.ndarray, cam_int: torch.Tensor
 ) -> dict:
@@ -779,13 +790,18 @@ def package_compact_outputs(
     shape_params = stack_person_field(outputs, "shape_params", 45)
     pred_cam_t = stack_person_field(outputs, "pred_cam_t", 3)
 
-    return {
+    packaged = {
         "mhr_model_params": mhr_model_params,
         "shape_params": shape_params,
         "pred_cam_t": pred_cam_t,
         "cam_int": cam_int_np,
         "image_size": image_size.astype(np.int32, copy=False),
     }
+    for optional_key in ("bbox", "det_score", "pred_keypoints_2d", "keypoint_score"):
+        optional_value = stack_optional_person_field(outputs, optional_key)
+        if optional_value is not None:
+            packaged[optional_key] = optional_value
+    return packaged
 
 
 def save_compact_npz(save_path: str, packaged_outputs: dict) -> None:
