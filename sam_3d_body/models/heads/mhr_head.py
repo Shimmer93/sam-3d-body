@@ -2,6 +2,7 @@
 
 import os
 import warnings
+from pathlib import Path
 from typing import Optional
 
 import roma
@@ -31,6 +32,14 @@ try:
 except:
     MOMENTUM_ENABLED = False
     warnings.warn("Momentum is not enabled")
+
+
+def _resolve_mhr_asset_folder(mhr_model_path: str) -> Path | None:
+    """Return the asset directory that contains the scripted MHR model."""
+    if not mhr_model_path:
+        return None
+    path = Path(mhr_model_path).expanduser()
+    return path.parent if path.suffix else path
 
 
 class MHRHead(nn.Module):
@@ -106,9 +115,14 @@ class MHRHead(nn.Module):
 
         # Load MHR itself
         if MOMENTUM_ENABLED:
+            mhr_asset_folder = _resolve_mhr_asset_folder(mhr_model_path)
+            mhr_kwargs = {}
+            if mhr_asset_folder is not None:
+                mhr_kwargs["folder"] = mhr_asset_folder
             self.mhr = MHR.from_files(
                 device=torch.device("cuda" if torch.cuda.is_available() else "cpu"),
                 lod=1,
+                **mhr_kwargs,
             )
         else:
             self.mhr = torch.jit.load(

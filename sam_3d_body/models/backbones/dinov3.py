@@ -1,5 +1,8 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
+import os
+from pathlib import Path
+
 import torch
 from torch import nn
 
@@ -12,13 +15,23 @@ class Dinov3Backbone(nn.Module):
         self.name = name
         self.cfg = cfg
 
-        self.encoder = torch.hub.load(
-            "facebookresearch/dinov3",
-            self.name,
-            source="github",
-            pretrained=False,
-            drop_path=self.cfg.MODEL.BACKBONE.DROP_PATH_RATE,
-        )
+        dinov3_repo = _resolve_local_dinov3_repo()
+        if dinov3_repo is not None:
+            self.encoder = torch.hub.load(
+                str(dinov3_repo),
+                self.name,
+                source="local",
+                pretrained=False,
+                drop_path=self.cfg.MODEL.BACKBONE.DROP_PATH_RATE,
+            )
+        else:
+            self.encoder = torch.hub.load(
+                "facebookresearch/dinov3",
+                self.name,
+                source="github",
+                pretrained=False,
+                drop_path=self.cfg.MODEL.BACKBONE.DROP_PATH_RATE,
+            )
         self.patch_size = self.encoder.patch_size
         self.embed_dim = self.embed_dims = self.encoder.embed_dim
 
@@ -67,3 +80,15 @@ class Dinov3Backbone(nn.Module):
             layer_depth = num_layers - 1
 
         return layer_depth, num_layers
+
+
+def _resolve_local_dinov3_repo() -> Path | None:
+    override = os.environ.get("DINOV3_REPO_PATH", "").strip()
+    if override:
+        path = Path(override).expanduser().resolve()
+        if (path / "hubconf.py").exists():
+            return path
+    candidate = Path(torch.hub.get_dir()).expanduser() / "facebookresearch_dinov3_main"
+    if (candidate / "hubconf.py").exists():
+        return candidate
+    return None

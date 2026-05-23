@@ -918,9 +918,10 @@ def main(args):
             name=args.detector_name, device=device, path=detector_path
         )
 
-    if (
-        args.segmentor_name == "sam2" and len(segmentor_path)
-    ) or args.segmentor_name != "sam2":
+    if args.segmentor_name and (
+        (args.segmentor_name == "sam2" and len(segmentor_path))
+        or args.segmentor_name != "sam2"
+    ):
         from tools.build_sam import HumanSegmentor
 
         human_segmentor = HumanSegmentor(
