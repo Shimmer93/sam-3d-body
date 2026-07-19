@@ -716,19 +716,26 @@ def package_optional_smpl_outputs(outputs, exporters) -> dict:
     return packaged
 
 
-def empty_compact_result(image_size: np.ndarray, cam_int: torch.Tensor) -> dict:
+def empty_compact_result(
+    image_size: np.ndarray, cam_int: torch.Tensor, save_masks: bool = False
+) -> dict:
     """Create an empty compact result package for images with no detections."""
     cam_int_np = cam_int.detach().cpu().numpy().astype(np.float32)
     if cam_int_np.shape[0] == 1:
         cam_int_np = cam_int_np[0]
 
-    return {
+    result = {
         "mhr_model_params": np.empty((0, 204), dtype=np.float32),
         "shape_params": np.empty((0, 45), dtype=np.float32),
         "pred_cam_t": np.empty((0, 3), dtype=np.float32),
         "cam_int": cam_int_np,
         "image_size": image_size.astype(np.int32, copy=False),
     }
+    if save_masks:
+        height, width = image_size.astype(np.int32, copy=False).tolist()
+        result["segmentation_masks"] = np.empty((0, height, width), dtype=np.uint8)
+        result["segmentation_mask_valid"] = np.empty((0,), dtype=bool)
+    return result
 
 
 def stack_person_field(outputs, key: str, expected_dim: int) -> np.ndarray:
@@ -757,8 +764,36 @@ def stack_person_field(outputs, key: str, expected_dim: int) -> np.ndarray:
     return stacked
 
 
+def stack_segmentation_masks(outputs, image_size: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Stack full-image segmentation masks returned by the optional segmentor."""
+    height, width = image_size.astype(np.int32, copy=False).tolist()
+    masks = []
+    valid = []
+    for person_output in outputs:
+        mask = person_output.get("mask")
+        if mask is None:
+            masks.append(np.zeros((height, width), dtype=np.uint8))
+            valid.append(False)
+            continue
+        mask = np.asarray(mask)
+        if mask.ndim == 3 and mask.shape[-1] == 1:
+            mask = mask[..., 0]
+        if mask.shape != (height, width):
+            raise ValueError(
+                f"Unexpected segmentation mask shape: got {mask.shape}, "
+                f"expected {(height, width)}"
+            )
+        binary_mask = (mask > 0).astype(np.uint8)
+        masks.append(binary_mask)
+        valid.append(bool(binary_mask.any()))
+    return np.stack(masks, axis=0), np.asarray(valid, dtype=bool)
+
+
 def package_compact_outputs(
-    outputs, image_size: np.ndarray, cam_int: torch.Tensor
+    outputs,
+    image_size: np.ndarray,
+    cam_int: torch.Tensor,
+    save_masks: bool = False,
 ) -> dict:
     """
     Convert estimator outputs into the requested compact `.npz` payload.
@@ -775,19 +810,26 @@ def package_compact_outputs(
         )
 
     if len(outputs) == 0:
-        return empty_compact_result(image_size, cam_int)
+        return empty_compact_result(image_size, cam_int, save_masks=save_masks)
 
     mhr_model_params = stack_person_field(outputs, "mhr_model_params", 204)
     shape_params = stack_person_field(outputs, "shape_params", 45)
     pred_cam_t = stack_person_field(outputs, "pred_cam_t", 3)
 
-    return {
+    result = {
         "mhr_model_params": mhr_model_params,
         "shape_params": shape_params,
         "pred_cam_t": pred_cam_t,
         "cam_int": cam_int_np,
         "image_size": image_size.astype(np.int32, copy=False),
     }
+    if save_masks:
+        segmentation_masks, segmentation_mask_valid = stack_segmentation_masks(
+            outputs, image_size
+        )
+        result["segmentation_masks"] = segmentation_masks
+        result["segmentation_mask_valid"] = segmentation_mask_valid
+    return result
 
 
 def save_compact_npz(save_path: str, packaged_outputs: dict) -> None:
@@ -991,7 +1033,7 @@ def main(args):
             ):
                 n_persons = len(outputs)
                 packaged = package_compact_outputs(
-                    outputs, image_size, cam_int
+                    outputs, image_size, cam_int, save_masks=args.save_masks
                 )
                 # Slice the batched SMPL arrays for this image's persons.
                 for key, value in all_smpl.items():
@@ -1024,7 +1066,7 @@ def main(args):
             )
 
             packaged_outputs = package_compact_outputs(
-                outputs, image_size, cam_int
+                outputs, image_size, cam_int, save_masks=args.save_masks
             )
             packaged_outputs.update(
                 package_optional_smpl_outputs(outputs, smpl_exporters)
@@ -1051,6 +1093,8 @@ if __name__ == "__main__":
                     * pred_cam_t (N, 3)
                     * cam_int (3, 3)
                     * image_size (2,)
+                    * optionally, segmentation_masks (N, H, W) when `--save_masks` is used
+                    * optionally, segmentation_mask_valid (N,) when `--save_masks` is used
                     * optionally, `smpl_*` arrays when `--export_smpl_params` is used
                     * optionally, `smplx_*` arrays when `--export_smplx_params` is used
 
@@ -1139,6 +1183,12 @@ if __name__ == "__main__":
         action="store_true",
         default=False,
         help="Use mask-conditioned prediction (segmentation mask is automatically generated from bbox)",
+    )
+    parser.add_argument(
+        "--save_masks",
+        action="store_true",
+        default=False,
+        help="Save full-image segmentation masks in the compact npz output",
     )
     parser.add_argument(
         "--inference_type",
